@@ -353,7 +353,310 @@ async def get_leave_requests(current_user: dict = Depends(get_current_user)):
         requests = list(leave_requests_collection.find({"user_id": current_user["user_id"]}, {"_id": 0}))
     else:
         requests = list(leave_requests_collection.find({}, {"_id": 0}))
+    
+    # Enrich with user and leave type information
+    for request in requests:
+        user = users_collection.find_one({"user_id": request["user_id"]})
+        leave_type = leave_types_collection.find_one({"type_id": request["leave_type_id"]})
+        if user:
+            request["user_name"] = user["full_name"]
+            request["employee_id"] = user["employee_id"]
+        if leave_type:
+            request["leave_type_name"] = leave_type["name"]
+    
     return requests
+
+@app.put("/api/leave/requests/{request_id}")
+async def update_leave_request(request_id: str, status: str, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Not authorized to approve/reject leave requests")
+    
+    if status not in ["approved", "rejected"]:
+        raise HTTPException(status_code=400, detail="Status must be 'approved' or 'rejected'")
+    
+    update_data = {
+        "status": status,
+        "approved_by": current_user["user_id"],
+        "approved_at": datetime.utcnow()
+    }
+    
+    result = leave_requests_collection.update_one(
+        {"request_id": request_id},
+        {"$set": update_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    
+    return {"message": f"Leave request {status} successfully"}
+
+# Expense Management endpoints
+@app.post("/api/expense/request")
+async def submit_expense(expense_request: ExpenseRequest, current_user: dict = Depends(get_current_user)):
+    request_id = str(uuid.uuid4())
+    
+    # Validate expense category
+    category = expense_categories_collection.find_one({"category_id": expense_request.category_id})
+    if not category:
+        raise HTTPException(status_code=404, detail="Expense category not found")
+    
+    expense_doc = {
+        "request_id": request_id,
+        "user_id": current_user["user_id"],
+        "category_id": expense_request.category_id,
+        "amount": expense_request.amount,
+        "expense_date": expense_request.expense_date,
+        "description": expense_request.description,
+        "status": "pending",
+        "manager_id": expense_request.manager_id,
+        "submitted_at": datetime.utcnow(),
+        "approved_at": None,
+        "approved_by": None,
+        "receipt_url": None
+    }
+    
+    expense_requests_collection.insert_one(expense_doc)
+    return {"message": "Expense request submitted successfully", "request_id": request_id}
+
+@app.get("/api/expense/requests")
+async def get_expense_requests(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] == "employee":
+        requests = list(expense_requests_collection.find({"user_id": current_user["user_id"]}, {"_id": 0}))
+    else:
+        requests = list(expense_requests_collection.find({}, {"_id": 0}))
+    
+    # Enrich with user and category information
+    for request in requests:
+        user = users_collection.find_one({"user_id": request["user_id"]})
+        category = expense_categories_collection.find_one({"category_id": request["category_id"]})
+        if user:
+            request["user_name"] = user["full_name"]
+            request["employee_id"] = user["employee_id"]
+        if category:
+            request["category_name"] = category["name"]
+    
+    return requests
+
+@app.get("/api/expense/categories")
+async def get_expense_categories(current_user: dict = Depends(get_current_user)):
+    categories = list(expense_categories_collection.find({}, {"_id": 0}))
+    return categories
+
+@app.put("/api/expense/requests/{request_id}")
+async def update_expense_request(request_id: str, status: str, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ["admin", "manager"]:
+        raise HTTPException(status_code=403, detail="Not authorized to approve/reject expense requests")
+    
+    if status not in ["approved", "rejected"]:
+        raise HTTPException(status_code=400, detail="Status must be 'approved' or 'rejected'")
+    
+    update_data = {
+        "status": status,
+        "approved_by": current_user["user_id"],
+        "approved_at": datetime.utcnow()
+    }
+    
+    result = expense_requests_collection.update_one(
+        {"request_id": request_id},
+        {"$set": update_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Expense request not found")
+    
+    return {"message": f"Expense request {status} successfully"}
+
+# File upload for receipts
+@app.post("/api/expense/upload-receipt/{request_id}")
+async def upload_receipt(request_id: str, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    # Check if expense request exists and belongs to user
+    expense = expense_requests_collection.find_one({"request_id": request_id, "user_id": current_user["user_id"]})
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense request not found")
+    
+    # Validate file type
+    if not file.content_type.startswith(('image/', 'application/pdf')):
+        raise HTTPException(status_code=400, detail="Only image and PDF files are allowed")
+    
+    # Create filename
+    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+    filename = f"receipt_{request_id}_{int(datetime.utcnow().timestamp())}.{file_extension}"
+    file_path = UPLOAD_DIR / filename
+    
+    # Save file
+    async with aiofiles.open(file_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    # Update expense request with receipt URL
+    receipt_url = f"/uploads/{filename}"
+    expense_requests_collection.update_one(
+        {"request_id": request_id},
+        {"$set": {"receipt_url": receipt_url}}
+    )
+    
+    return {"message": "Receipt uploaded successfully", "receipt_url": receipt_url}
+
+# Attendance endpoints
+@app.post("/api/attendance/log")
+async def log_attendance(attendance: AttendanceLog, current_user: dict = Depends(get_current_user)):
+    log_id = str(uuid.uuid4())
+    
+    # Check if already checked in/out today
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    
+    existing_log = attendance_collection.find_one({
+        "user_id": current_user["user_id"],
+        "action": attendance.action,
+        "timestamp": {"$gte": today_start, "$lt": today_end}
+    })
+    
+    if existing_log:
+        raise HTTPException(status_code=400, detail=f"Already {attendance.action.replace('_', ' ')} today")
+    
+    attendance_doc = {
+        "log_id": log_id,
+        "user_id": current_user["user_id"],
+        "action": attendance.action,
+        "timestamp": datetime.utcnow(),
+        "location": attendance.location,
+        "date": datetime.utcnow().date().isoformat()
+    }
+    
+    attendance_collection.insert_one(attendance_doc)
+    return {"message": f"Successfully {attendance.action.replace('_', ' ')}", "log_id": log_id}
+
+@app.get("/api/attendance/logs")
+async def get_attendance_logs(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] == "employee":
+        logs = list(attendance_collection.find({"user_id": current_user["user_id"]}, {"_id": 0}).sort("timestamp", -1))
+    else:
+        logs = list(attendance_collection.find({}, {"_id": 0}).sort("timestamp", -1))
+        # Enrich with user information for managers/admins
+        for log in logs:
+            user = users_collection.find_one({"user_id": log["user_id"]})
+            if user:
+                log["user_name"] = user["full_name"]
+                log["employee_id"] = user["employee_id"]
+    
+    return logs
+
+@app.get("/api/attendance/status")
+async def get_attendance_status(current_user: dict = Depends(get_current_user)):
+    today = datetime.utcnow().date().isoformat()
+    
+    check_in = attendance_collection.find_one({
+        "user_id": current_user["user_id"],
+        "action": "check_in",
+        "date": today
+    })
+    
+    check_out = attendance_collection.find_one({
+        "user_id": current_user["user_id"],
+        "action": "check_out", 
+        "date": today
+    })
+    
+    return {
+        "checked_in": check_in is not None,
+        "checked_out": check_out is not None,
+        "check_in_time": check_in["timestamp"] if check_in else None,
+        "check_out_time": check_out["timestamp"] if check_out else None
+    }
+
+# Reports and Analytics endpoints
+@app.get("/api/reports/leave-summary")
+async def get_leave_summary(current_user: dict = Depends(get_current_user)):
+    # Leave requests by status
+    pipeline = [
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        {"$project": {"status": "$_id", "count": 1, "_id": 0}}
+    ]
+    status_counts = list(leave_requests_collection.aggregate(pipeline))
+    
+    # Leave requests by type
+    type_pipeline = [
+        {"$group": {"_id": "$leave_type_id", "count": {"$sum": 1}}}
+    ]
+    type_counts = list(leave_requests_collection.aggregate(type_pipeline))
+    
+    # Enrich type counts with leave type names
+    for item in type_counts:
+        leave_type = leave_types_collection.find_one({"type_id": item["_id"]})
+        item["type_name"] = leave_type["name"] if leave_type else "Unknown"
+    
+    return {
+        "by_status": status_counts,
+        "by_type": type_counts
+    }
+
+@app.get("/api/reports/expense-summary")
+async def get_expense_summary(current_user: dict = Depends(get_current_user)):
+    # Expense requests by status
+    pipeline = [
+        {"$group": {"_id": "$status", "count": {"$sum": 1}, "total_amount": {"$sum": "$amount"}}},
+        {"$project": {"status": "$_id", "count": 1, "total_amount": 1, "_id": 0}}
+    ]
+    status_counts = list(expense_requests_collection.aggregate(pipeline))
+    
+    # Expense requests by category
+    category_pipeline = [
+        {"$group": {"_id": "$category_id", "count": {"$sum": 1}, "total_amount": {"$sum": "$amount"}}}
+    ]
+    category_counts = list(expense_requests_collection.aggregate(category_pipeline))
+    
+    # Enrich category counts
+    for item in category_counts:
+        category = expense_categories_collection.find_one({"category_id": item["_id"]})
+        item["category_name"] = category["name"] if category else "Unknown"
+    
+    return {
+        "by_status": status_counts,
+        "by_category": category_counts
+    }
+
+# Admin Panel endpoints
+@app.get("/api/admin/users")
+async def get_all_users(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ["admin", "hr"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    users = list(users_collection.find({}, {"_id": 0, "password_hash": 0}))
+    return users
+
+@app.get("/api/admin/departments")
+async def get_departments(current_user: dict = Depends(get_current_user)):
+    departments = list(departments_collection.find({}, {"_id": 0}))
+    return departments
+
+@app.post("/api/admin/departments")
+async def create_department(name: str, description: str, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ["admin", "hr"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    dept_id = str(uuid.uuid4())
+    department_doc = {
+        "dept_id": dept_id,
+        "name": name,
+        "description": description,
+        "manager_id": None,
+        "created_at": datetime.utcnow()
+    }
+    
+    departments_collection.insert_one(department_doc)
+    return {"message": "Department created successfully", "dept_id": dept_id}
+
+@app.delete("/api/admin/leave-types/{type_id}")
+async def delete_leave_type(type_id: str, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ["admin", "hr"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    result = leave_types_collection.delete_one({"type_id": type_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Leave type not found")
+    
+    return {"message": "Leave type deleted successfully"}
 
 # Health check
 @app.get("/api/health")
