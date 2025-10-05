@@ -20,6 +20,7 @@ import {
   Legend,
   ResponsiveContainer,
   PieChart as RechartsPieChart,
+  Pie,
   Cell,
   LineChart,
   Line,
