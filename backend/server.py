@@ -41,8 +41,8 @@ expense_requests_collection = db.expense_requests
 attendance_collection = db.attendance
 holidays_collection = db.holidays
 
-# Security
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Security  
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 security = HTTPBearer()
 JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'your-secret-key-here')
 JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
